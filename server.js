@@ -7,8 +7,6 @@ import { promisify } from "node:util";
 
 const UP = "https://generativelanguage.googleapis.com/upload/v1beta/files";
 const FILES = "https://generativelanguage.googleapis.com/v1beta/files";
-const DEFAULT_BUBBLE_CALLBACK_URL =
-  "https://castingsource.bubbleapps.io/version-836j0/api/1.1/wf/ai_response/initialize";
 
 const LIM = {
   v: 500 * 1024 * 1024,
@@ -53,6 +51,53 @@ const fetchOpts = {
 };
 
 const s = (v) => (v == null ? "" : String(v).replace(/\0/g, ""));
+const cleanApiKey = (v) => {
+  if (v == null) return "";
+  const t = String(v).trim();
+  if (!t) return "";
+  const lower = t.toLowerCase();
+  if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
+  return t;
+};
+const cleanOptionalUrl = (v) => {
+  if (v == null) return "";
+  const t = String(v).trim();
+  if (!t) return "";
+  const lower = t.toLowerCase();
+  if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
+  return t;
+};
+const parseModelList = (v) => {
+  if (Array.isArray(v)) return v.map((x) => String(x || "").trim()).filter(Boolean);
+  const t = String(v || "").trim();
+  if (!t) return [];
+  if (t.startsWith("[") && t.endsWith("]")) {
+    try {
+      const arr = JSON.parse(t);
+      if (Array.isArray(arr)) return arr.map((x) => String(x || "").trim()).filter(Boolean);
+    } catch {
+      /* fall through to CSV parsing */
+    }
+  }
+  return t
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+};
+
+function logError(stage, err, context = {}) {
+  const message = String(err?.message || err);
+  const stack = err?.stack ? String(err.stack).split("\n").slice(0, 6).join("\n") : "";
+  console.error(`[error] ${stage}: ${message}`);
+  if (Object.keys(context).length) {
+    try {
+      console.error("[error-context]", JSON.stringify(context));
+    } catch {
+      console.error("[error-context]", context);
+    }
+  }
+  if (stack) console.error(stack);
+}
 
 /** Parse JSON from Gemini/HTTP bodies; strips BOM, markdown fences, or leading junk. */
 function parseJsonSafe(raw, label) {
@@ -247,11 +292,17 @@ async function waitActive(apiKey, fileName) {
 
 async function analyzeCasting(properties) {
   const p = properties || {};
-  const apiKey = p.gemini_api_key || p.api_key || process.env.GEMINI_API_KEY;
-  const model = p.model || "gemini-2.5-flash";
+  const apiKey = cleanApiKey(p.gemini_api_key) || cleanApiKey(p.api_key) || cleanApiKey(process.env.GEMINI_API_KEY);
+  const requestModelList = parseModelList(p.models);
+  const envModelList = parseModelList(process.env.MODEL_PRIORITY);
+  const modelPriority = Array.from(new Set([...requestModelList, ...envModelList].filter(Boolean)));
   const videoUrl = normalizeUrl(p.video_url);
 
   if (!apiKey) throw new Error("gemini_api_key required or set GEMINI_API_KEY env var");
+  if (!modelPriority.length) {
+    throw new Error("No models configured. Provide `models` in request or set MODEL_PRIORITY env var.");
+  }
+  console.log(`[model-selection] priority=${modelPriority.join(" -> ")}`);
   if (!videoUrl) throw new Error("video_url required");
 
   const resumeUrl = p.resume_url ? normalizeUrl(p.resume_url) : "";
@@ -369,54 +420,61 @@ async function analyzeCasting(properties) {
     });
 
     const genText = await genRes.text();
+    console.log(`[gemini] model=${modelName} status=${genRes.status}`);
+    if (!genRes.ok) {
+      console.error(`[gemini] non-ok response body snippet: ${genText.slice(0, 1000)}`);
+    }
     let genJson;
     try {
       genJson = parseJsonSafe(genText, "generateContent");
     } catch (e) {
+      logError("gemini-parse-response", e, { modelName, status: genRes.status, bodySnippet: genText.slice(0, 1000) });
       throw new Error(`generateContent ${genRes.status}: ${e.message || genText.slice(0, 800)}`);
     }
     return { genRes, genText, genJson, modelName };
   };
 
-  const shouldFallbackToFlashLite = (resp) => {
+  const isRetryableModelError = (resp) => {
     if (!resp || resp.genRes.ok) return false;
-    if (resp.modelName !== "gemini-2.5-flash") return false;
-
     const status = Number(resp.genRes.status);
     const message = String(resp.genJson?.error?.message || resp.genText || "").toLowerCase();
-    const isCapacityStatus = status === 429 || status === 503;
+    const isCapacityStatus = status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
     const isHighDemand =
       message.includes("currently experiencing high demand") ||
       message.includes("spikes in demand") ||
-      message.includes("try again later");
-    return isCapacityStatus && isHighDemand;
+      message.includes("try again later") ||
+      message.includes("resource_exhausted") ||
+      message.includes("rate limit");
+    return isCapacityStatus || isHighDemand;
   };
 
-  const flashMaxAttempts = Math.max(1, Number(process.env.FLASH_MAX_ATTEMPTS || 4));
-  const allowFlashLiteFallback = String(process.env.ALLOW_FLASH_LITE_FALLBACK || "true").toLowerCase() !== "false";
+  const maxAttemptsPerModel = Math.max(1, Number(process.env.MODEL_MAX_ATTEMPTS || 3));
+  let genAttempt = null;
+  let finalError = null;
 
-  let genAttempt;
-  if (model === "gemini-2.5-flash") {
-    for (let attempt = 1; attempt <= flashMaxAttempts; attempt++) {
-      genAttempt = await callGenerateContent(model);
+  for (let modelIndex = 0; modelIndex < modelPriority.length; modelIndex++) {
+    const modelName = modelPriority[modelIndex];
+    console.log(`[model-selection] trying model=${modelName} order=${modelIndex + 1}/${modelPriority.length}`);
+
+    for (let attempt = 1; attempt <= maxAttemptsPerModel; attempt++) {
+      genAttempt = await callGenerateContent(modelName);
       if (genAttempt.genRes.ok) break;
 
-      const shouldRetryFlash = shouldFallbackToFlashLite(genAttempt) && attempt < flashMaxAttempts;
-      if (!shouldRetryFlash) break;
+      finalError = new Error(genAttempt.genJson?.error?.message || genAttempt.genText || "Model request failed");
+      const shouldRetry = isRetryableModelError(genAttempt) && attempt < maxAttemptsPerModel;
+      if (!shouldRetry) break;
 
-      const baseBackoffMs = Math.min(15000, 1000 * Math.pow(2, attempt - 1));
-      const jitterMs = Math.floor(Math.random() * 400);
+      const baseBackoffMs = Math.min(20000, 1200 * Math.pow(2, attempt - 1));
+      const jitterMs = Math.floor(Math.random() * 500);
       await sleep(baseBackoffMs + jitterMs);
     }
 
-    if (allowFlashLiteFallback && shouldFallbackToFlashLite(genAttempt)) {
-      genAttempt = await callGenerateContent("gemini-2.5-flash-lite");
-    }
-  } else {
-    genAttempt = await callGenerateContent(model);
+    if (genAttempt?.genRes?.ok) break;
   }
 
-  if (!genAttempt.genRes.ok) throw new Error(genAttempt.genJson?.error?.message || genAttempt.genText);
+  if (!genAttempt || !genAttempt.genRes.ok) {
+    throw finalError || new Error(genAttempt?.genJson?.error?.message || genAttempt?.genText || "Model request failed");
+  }
   if (!genAttempt.genJson.candidates?.length) {
     const br = genAttempt.genJson?.promptFeedback?.blockReason || "";
     throw new Error(`Gemini returned no candidates. ${br}`);
@@ -451,30 +509,48 @@ async function analyzeCasting(properties) {
 }
 
 async function sendBubbleCallback(payload, callbackUrl) {
-  const url = normalizeUrl(callbackUrl || DEFAULT_BUBBLE_CALLBACK_URL);
-  if (!url) throw new Error("Missing callback URL");
+  const requestedCallbackUrl = cleanOptionalUrl(callbackUrl);
+  const configuredDefaultCallbackUrl = cleanOptionalUrl(process.env.BUBBLE_CALLBACK_URL);
+  const baseUrl = normalizeUrl(requestedCallbackUrl || configuredDefaultCallbackUrl);
+  if (!baseUrl) throw new Error("Missing callback URL");
+  if (/^https?:\/\/null(?:\/|$)/i.test(baseUrl) || /^https?:\/\/undefined(?:\/|$)/i.test(baseUrl)) {
+    throw new Error(`Invalid callback URL after normalization: ${baseUrl}`);
+  }
+  const callbackCandidates = [];
+  const withoutInitialize = baseUrl.replace(/\/initialize(?:\?.*)?$/i, "");
+  callbackCandidates.push(baseUrl);
+  if (withoutInitialize && withoutInitialize !== baseUrl) callbackCandidates.push(withoutInitialize);
 
   const maxAttempts = Math.max(1, Number(process.env.CALLBACK_MAX_ATTEMPTS || 4));
   let lastErr = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+    for (const url of callbackCandidates) {
+      try {
+        console.log(`[callback] attempt=${attempt}/${maxAttempts} url=${url}`);
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
 
-      if (res.ok) return;
+        if (res.ok) {
+          console.log(`[callback] success status=${res.status} url=${url}`);
+          return;
+        }
 
-      const t = await res.text();
-      const retryable = res.status === 408 || res.status === 409 || res.status === 425 || res.status === 429 || res.status >= 500;
-      if (!retryable) {
-        throw new Error(`Callback failed ${res.status}: ${t.slice(0, 800)}`);
+        const t = await res.text();
+        console.error(`[callback] non-ok status=${res.status} url=${url} body=${t.slice(0, 1000)}`);
+        const retryable =
+          res.status === 408 || res.status === 409 || res.status === 425 || res.status === 429 || res.status >= 500;
+        if (!retryable) {
+          throw new Error(`Callback failed ${res.status}: ${t.slice(0, 800)}`);
+        }
+        lastErr = new Error(`Retryable callback failure ${res.status}: ${t.slice(0, 800)}`);
+      } catch (e) {
+        logError("bubble-callback-attempt", e, { attempt, url });
+        lastErr = e;
       }
-      lastErr = new Error(`Retryable callback failure ${res.status}: ${t.slice(0, 800)}`);
-    } catch (e) {
-      lastErr = e;
     }
 
     if (attempt < maxAttempts) {
@@ -567,6 +643,9 @@ function pumpQueue() {
     if (!existing || existing.status !== "queued") continue;
 
     activeWorkers += 1;
+    console.log(
+      `[jobs] start id=${jobId} queue_depth=${queueDepth()} active_workers=${activeWorkers} application_id=${payload?.application_id ?? ""}`
+    );
     jobs.set(jobId, { ...existing, status: "processing", startedAt: new Date().toISOString() });
 
     (async () => {
@@ -581,18 +660,23 @@ function pumpQueue() {
             result,
           });
         }
+        console.log(`[jobs] completed id=${jobId}`);
 
         await sendBubbleCallback(
           {
             status: "completed",
-            role_id: payload.role_id ?? null,
+            application_id: payload.application_id ?? null,
             video_link: payload.video_link ?? payload.video_url ?? null,
-            more_info: payload.more_info ?? null,
             ...result,
           },
           payload.callback_url
         );
       } catch (err) {
+        logError("job-processing", err, {
+          jobId,
+          application_id: payload?.application_id ?? null,
+          video_link: payload?.video_link ?? payload?.video_url ?? null,
+        });
         const curr = jobs.get(jobId);
         if (curr) {
           jobs.set(jobId, {
@@ -607,15 +691,14 @@ function pumpQueue() {
           await sendBubbleCallback(
             {
               status: "failed",
-              role_id: payload.role_id ?? null,
+              application_id: payload.application_id ?? null,
               video_link: payload.video_link ?? payload.video_url ?? null,
-              more_info: payload.more_info ?? null,
               error: String(err?.message || err),
             },
             payload.callback_url
           );
         } catch (cbErr) {
-          console.error("Bubble callback failure:", String(cbErr?.message || cbErr));
+          logError("bubble-callback-final-failure", cbErr, { jobId, callback_url: payload?.callback_url ?? null });
         }
       } finally {
         activeWorkers = Math.max(0, activeWorkers - 1);
@@ -644,10 +727,6 @@ app.post("/jobs", (req, res) => {
     return res.status(429).json({
       error: "Queue is full",
       hint: "Please retry shortly.",
-      queue_depth: queueDepth(),
-      max_queue_size: MAX_QUEUE_SIZE,
-      active_workers: activeWorkers,
-      max_concurrent_jobs: MAX_CONCURRENT_JOBS,
     });
   }
 
@@ -665,16 +744,7 @@ app.post("/jobs", (req, res) => {
   });
 
   pendingQueue.push({ jobId, payload });
-  res.status(202).json({
-    accepted: true,
-    status: "queued",
-    callback_url: payload.callback_url || DEFAULT_BUBBLE_CALLBACK_URL,
-    role_id: payload.role_id ?? null,
-    video_link: payload.video_link || null,
-    queue_position: queueDepth(),
-    queue_depth: queueDepth(),
-    active_workers: activeWorkers,
-  });
+  res.status(200).json({ ok: true, status: "accepted" });
   setImmediate(pumpQueue);
 });
 
