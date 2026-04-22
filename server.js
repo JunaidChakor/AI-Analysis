@@ -1,4 +1,4 @@
-import express from "express";
+  import express from "express";
 import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
 import { jsonrepair } from "jsonrepair";
@@ -28,6 +28,12 @@ const MIME = {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const libreConvertAsync = promisify(libre.convert);
+const DEFAULT_HTTP_TIMEOUT_MS = Math.max(5000, Number(process.env.HTTP_TIMEOUT_MS || 180000));
+const MEDIA_HTTP_TIMEOUT_MS = Math.max(
+  DEFAULT_HTTP_TIMEOUT_MS,
+  Number(process.env.HTTP_MEDIA_TIMEOUT_MS || 45 * 60 * 1000)
+);
+const FILE_ACTIVE_TIMEOUT_MS = Math.max(600000, Number(process.env.FILE_ACTIVE_TIMEOUT_MS || 45 * 60 * 1000));
 
 const ext = (n) => {
   const i = String(n || "").lastIndexOf(".");
@@ -49,6 +55,35 @@ const fetchOpts = {
   redirect: "follow",
   headers: { "User-Agent": "CastingRenderService/1" },
 };
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS, label = "http-request") {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function readWithTimeout(promise, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS, label = "http-read") {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 const s = (v) => (v == null ? "" : String(v).replace(/\0/g, ""));
 const cleanApiKey = (v) => {
@@ -137,10 +172,12 @@ async function fetchBinary(url) {
   console.log("Fetching:", abs);
   if (!abs) throw new Error("Missing file URL");
 
-  const res = await fetch(abs, fetchOpts);
+  const t0 = Date.now();
+  const res = await fetchWithTimeout(abs, fetchOpts, MEDIA_HTTP_TIMEOUT_MS, "fetchBinary:request");
   if (!res.ok) throw new Error(`Fetch ${res.status}: ${abs}`);
 
-  const ab = await res.arrayBuffer();
+  console.log(`[fetchBinary] response headers received url=${abs}`);
+  const ab = await readWithTimeout(res.arrayBuffer(), MEDIA_HTTP_TIMEOUT_MS, "fetchBinary:body");
   let name = "file";
 
   try {
@@ -150,6 +187,8 @@ async function fetchBinary(url) {
   } catch {}
 
   const buffer = Buffer.from(ab);
+  const elapsed = Date.now() - t0;
+  console.log(`[fetchBinary] completed url=${abs} bytes=${buffer.length} elapsed_ms=${elapsed}`);
   return { buffer, name, size: buffer.length };
 }
 
@@ -175,7 +214,9 @@ async function upload(apiKey, fileBuffer, displayName, mimeType) {
     meta = JSON.stringify({ file: { display_name: "upload.bin", mime_type: mimeType } });
   }
 
-  const startRes = await fetch(`${UP}?key=${encodeURIComponent(apiKey)}`, {
+  const startRes = await fetchWithTimeout(
+    `${UP}?key=${encodeURIComponent(apiKey)}`,
+    {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -185,15 +226,20 @@ async function upload(apiKey, fileBuffer, displayName, mimeType) {
       "X-Goog-Upload-Header-Content-Type": mimeType,
     },
     body: meta,
-  });
+    },
+    DEFAULT_HTTP_TIMEOUT_MS,
+    "upload:start"
+  );
 
   const uploadUrl = startRes.headers.get("x-goog-upload-url") || startRes.headers.get("X-Goog-Upload-Url");
   if (!uploadUrl) {
-    const t = await startRes.text();
+    const t = await readWithTimeout(startRes.text(), DEFAULT_HTTP_TIMEOUT_MS, "upload:start-read");
     throw new Error(`Upload start ${startRes.status}: ${t.slice(0, 800)}`);
   }
 
-  const upRes = await fetch(uploadUrl.trim(), {
+  const upRes = await fetchWithTimeout(
+    uploadUrl.trim(),
+    {
     method: "POST",
     headers: {
       "X-Goog-Upload-Offset": "0",
@@ -201,9 +247,12 @@ async function upload(apiKey, fileBuffer, displayName, mimeType) {
       "Content-Type": mimeType,
     },
     body: mid,
-  });
+    },
+    MEDIA_HTTP_TIMEOUT_MS,
+    "upload:bytes"
+  );
 
-  const text = await upRes.text();
+  const text = await readWithTimeout(upRes.text(), MEDIA_HTTP_TIMEOUT_MS, "upload:bytes-read");
 
   let json;
   try {
@@ -269,9 +318,9 @@ async function waitActive(apiKey, fileName) {
   const url = `${FILES}/${encodeURIComponent(id)}?key=${encodeURIComponent(apiKey)}`;
   const t0 = Date.now();
 
-  while (Date.now() - t0 < 600000) {
-    const res = await fetch(url, fetchOpts);
-    const text = await res.text();
+  while (Date.now() - t0 < FILE_ACTIVE_TIMEOUT_MS) {
+    const res = await fetchWithTimeout(url, fetchOpts, DEFAULT_HTTP_TIMEOUT_MS, "waitActive:status");
+    const text = await readWithTimeout(res.text(), DEFAULT_HTTP_TIMEOUT_MS, "waitActive:status-read");
 
     let json;
     try {
@@ -412,16 +461,21 @@ async function analyzeCasting(properties) {
 
   const callGenerateContent = async (modelName) => {
     const genUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const genRes = await fetch(genUrl, {
+    const genRes = await fetchWithTimeout(
+      genUrl,
+      {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts }],
         generationConfig: { responseMimeType: "application/json" },
       }),
-    });
+      },
+      DEFAULT_HTTP_TIMEOUT_MS,
+      `generateContent:${modelName}`
+    );
 
-    const genText = await genRes.text();
+    const genText = await readWithTimeout(genRes.text(), DEFAULT_HTTP_TIMEOUT_MS, `generateContent:${modelName}:read`);
     console.log(`[gemini] model=${modelName} status=${genRes.status}`);
     if (!genRes.ok) {
       console.error(`[gemini] non-ok response body snippet: ${genText.slice(0, 1000)}`);
@@ -530,18 +584,23 @@ async function sendBubbleCallback(payload, callbackUrl) {
     for (const url of callbackCandidates) {
       try {
         console.log(`[callback] attempt=${attempt}/${maxAttempts} url=${url}`);
-        const res = await fetch(url, {
+        const res = await fetchWithTimeout(
+          url,
+          {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
-        });
+          },
+          DEFAULT_HTTP_TIMEOUT_MS,
+          "bubble-callback"
+        );
 
         if (res.ok) {
           console.log(`[callback] success status=${res.status} url=${url}`);
           return;
         }
 
-        const t = await res.text();
+        const t = await readWithTimeout(res.text(), DEFAULT_HTTP_TIMEOUT_MS, "bubble-callback-read");
         console.error(`[callback] non-ok status=${res.status} url=${url} body=${t.slice(0, 1000)}`);
         const retryable =
           res.status === 408 || res.status === 409 || res.status === 425 || res.status === 429 || res.status >= 500;
