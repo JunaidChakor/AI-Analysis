@@ -427,6 +427,7 @@ async function analyzeCasting(properties) {
     "- overall_assessment: concise but detailed summary of fit for the role.\n" +
     "- recommendation: clear next step (for example callback, request more material, or not a fit) with brief rationale.\n\n" +
     "If something cannot be judged from the footage (for example poor mic, face not visible, clip too short), state that limitation in considerations rather than inventing facts.\n\n" +
+    "- Location fit: Prefer candidates in or near the role location. If far away, consider whether relocation or remote work is realistic based on the project.\n" +
     "Project Title: " + s(p.PROJECT_TITLE) +
     "\nProject Overview: " + s(p.project_overview) +
     "\nCasting for: " + s(p.casting_for) +
@@ -437,18 +438,14 @@ async function analyzeCasting(properties) {
     "\nRole Requirements: " + s(p.role_requirements) +
     "\nRole Characteristics: " + roleCharsText(p.role_characteristics) +
     "\nAge Range: " + s(p.age_range) +
-    "\nCountry: " + s(p.country) +
-    "\nState: " + s(p.role_state) +
-    "\nCity: " + s(p.city) +
+    "\nLocation: " + s(p.location) + " (role)" +
     "\nMinimum Height: " + s(p.minimum_height) +
     "\nMaximum Height: " + s(p.maximum_height) +
     "\nMinimum AI Score: " + s(p.minimum_ai_score) +
     "\n\nAPPLICANT\n" +
     "Gender: " + s(p.user_gender) +
     "\nAge: " + s(p.user_age) +
-    "\nCity: " + s(p.user_city) +
-    "\nState: " + s(p.user_state) +
-    "\nCountry: " + s(p.user_country) +
+    "\nLocation: " + s(p.user_location) + + " (applicant)" +
     "\nHeight: " + s(p.user_height) +
     "\nHeadshot URL (text field): " + (headshotText || "(not provided)") +
     "\nDrive Folder Link: " + (drive || "(not provided)") +
