@@ -534,6 +534,14 @@ async function analyzeCasting(properties) {
     return { genRes, genText, genJson, modelName };
   };
 
+  const buildGeminiError = (resp, fallbackMessage = "Model request failed") => {
+    const message = String(resp?.genJson?.error?.message || resp?.genText || fallbackMessage);
+    const err = new Error(message);
+    err.gemini_status = Number(resp?.genRes?.status || 0);
+    err.error_code = Number(resp?.genJson?.error?.code || 0);
+    return err;
+  };
+
   const isRetryableModelError = (resp) => {
     if (!resp || resp.genRes.ok) return false;
     const status = Number(resp.genRes.status);
@@ -560,7 +568,7 @@ async function analyzeCasting(properties) {
       genAttempt = await callGenerateContent(modelName);
       if (genAttempt.genRes.ok) break;
 
-      finalError = new Error(genAttempt.genJson?.error?.message || genAttempt.genText || "Model request failed");
+      finalError = buildGeminiError(genAttempt, "Model request failed");
       const shouldRetry = isRetryableModelError(genAttempt) && attempt < maxAttemptsPerModel;
       if (!shouldRetry) break;
 
@@ -573,7 +581,7 @@ async function analyzeCasting(properties) {
   }
 
   if (!genAttempt || !genAttempt.genRes.ok) {
-    throw finalError || new Error(genAttempt?.genJson?.error?.message || genAttempt?.genText || "Model request failed");
+    throw finalError || buildGeminiError(genAttempt, "Model request failed");
   }
   if (!genAttempt.genJson.candidates?.length) {
     const br = genAttempt.genJson?.promptFeedback?.blockReason || "";
@@ -605,6 +613,8 @@ async function analyzeCasting(properties) {
     considerations: toStrList(parsed.considerations),
     recommendation: s(parsed.recommendation),
     ai_score: aiScore,
+    gemini_status: Number(genAttempt.genRes.status || 0),
+    error_code: 0,
   };
 }
 
@@ -799,6 +809,8 @@ function pumpQueue() {
               application_id: payload.application_id ?? null,
               video_link: payload.video_link ?? payload.video_url ?? null,
               error: String(err?.message || err),
+              error_code: Number(err?.error_code || 0),
+              gemini_status: Number(err?.gemini_status || 0),
             },
             payload.callback_url
           );
