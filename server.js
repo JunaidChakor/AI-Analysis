@@ -46,6 +46,8 @@ const normalizeUrl = (u) => {
   if (u == null) return "";
   let t = String(u).trim();
   if (!t) return "";
+  const lower = t.toLowerCase();
+  if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
   if (t.startsWith("//")) return "https:" + t;
   if (!/^https?:\/\//i.test(t)) return "https://" + t.replace(/^\/+/, "");
   return t;
