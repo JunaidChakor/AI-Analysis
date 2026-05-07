@@ -188,14 +188,29 @@ async function fetchBinary(url) {
 
   const fetchDownloadWithRedirects = async (startUrl, headers, labelBase) => {
     const maxRedirects = Math.max(0, Number(process.env.DOWNLOAD_MAX_REDIRECTS || 5));
+    const startHost = new URL(startUrl).hostname.toLowerCase();
     let currentUrl = startUrl;
     for (let hop = 0; hop <= maxRedirects; hop++) {
+      let hopHeaders = headers || {};
+      if (hop > 0 && hopHeaders.Authorization) {
+        try {
+          const currentHost = new URL(currentUrl).hostname.toLowerCase();
+          if (currentHost !== startHost) {
+            const { Authorization, ...rest } = hopHeaders;
+            hopHeaders = rest;
+          }
+        } catch {
+          const { Authorization, ...rest } = hopHeaders;
+          hopHeaders = rest;
+        }
+      }
+
       const res = await fetchWithTimeout(
         currentUrl,
         {
           ...fetchOpts,
           redirect: "manual",
-          headers,
+          headers: hopHeaders,
         },
         MEDIA_HTTP_TIMEOUT_MS,
         `${labelBase}:hop-${hop}`
