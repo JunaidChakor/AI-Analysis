@@ -727,6 +727,20 @@ async function sendBubbleCallback(payload, callbackUrl) {
   throw new Error(`Bubble callback failed after retries: ${String(lastErr?.message || lastErr)}`);
 }
 
+function deriveErrorCode(err) {
+  const explicit = Number(err?.error_code || 0);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+
+  const msg = String(err?.message || err || "");
+  const fetchMatch = msg.match(/\bfetch\s+(\d{3})\b/i);
+  if (fetchMatch) return Number(fetchMatch[1]);
+
+  const genericStatus = msg.match(/\b(4\d\d|5\d\d)\b/);
+  if (genericStatus) return Number(genericStatus[1]);
+
+  return 1;
+}
+
 function normPath(p) {
   const s = (p || "").replace(/\/$/, "") || "/";
   return s;
@@ -856,7 +870,7 @@ function pumpQueue() {
             {
               status: String(err?.message || "failed"),
               application_id: payload.application_id ?? null,
-              error: Number(err?.error_code || 0),
+              error: deriveErrorCode(err),
               gemini_status: String(err?.gemini_status || ""),
             },
             payload.callback_url
