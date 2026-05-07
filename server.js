@@ -1,4 +1,4 @@
-  import express from "express";
+import express from "express";
 import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
 import { jsonrepair } from "jsonrepair";
@@ -53,8 +53,22 @@ const normalizeUrl = (u) => {
 
 const fetchOpts = {
   redirect: "follow",
-  headers: { "User-Agent": "CastingRenderService/1" },
 };
+
+function getBubbleDownloadAuthHeader() {
+  const raw =
+    String(process.env.MEDIA_ACCESS_TOKEN || "").trim();
+  if (!raw) return "";
+  return /^Bearer\s+/i.test(raw) ? raw : `Bearer ${raw}`;
+}
+
+function buildDownloadHeaders(absUrl) {
+  const headers = { "User-Agent": "CastingRenderService/1" };
+  const authHeader = getBubbleDownloadAuthHeader();
+  if (!authHeader) return headers;
+  headers.Authorization = authHeader;
+  return headers;
+}
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS, label = "http-request") {
   const controller = new AbortController();
@@ -173,7 +187,40 @@ async function fetchBinary(url) {
   if (!abs) throw new Error("Missing file URL");
 
   const t0 = Date.now();
-  const res = await fetchWithTimeout(abs, fetchOpts, MEDIA_HTTP_TIMEOUT_MS, "fetchBinary:request");
+  const authHeaders = buildDownloadHeaders(abs);
+  const hasAuth = Boolean(authHeaders.Authorization);
+  const noAuthHeaders = { "User-Agent": "CastingRenderService/1" };
+
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      abs,
+      { ...fetchOpts, headers: authHeaders },
+      MEDIA_HTTP_TIMEOUT_MS,
+      "fetchBinary:request"
+    );
+  } catch (err) {
+    if (!hasAuth) throw err;
+    console.warn(`[fetchBinary] request failed with token, retrying without token url=${abs}`);
+    res = await fetchWithTimeout(
+      abs,
+      { ...fetchOpts, headers: noAuthHeaders },
+      MEDIA_HTTP_TIMEOUT_MS,
+      "fetchBinary:request-no-token"
+    );
+  }
+
+  if (!res.ok && hasAuth) {
+    console.warn(`[fetchBinary] status=${res.status} with token, retrying without token url=${abs}`);
+    const retryRes = await fetchWithTimeout(
+      abs,
+      { ...fetchOpts, headers: noAuthHeaders },
+      MEDIA_HTTP_TIMEOUT_MS,
+      "fetchBinary:request-no-token"
+    );
+    if (retryRes.ok) res = retryRes;
+  }
+
   if (!res.ok) throw new Error(`Fetch ${res.status}: ${abs}`);
 
   console.log(`[fetchBinary] response headers received url=${abs}`);
