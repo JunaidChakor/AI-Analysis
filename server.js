@@ -48,6 +48,9 @@ const normalizeUrl = (u) => {
   if (!t) return "";
   const lower = t.toLowerCase();
   if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
+  // Fix malformed scheme prefixes observed from upstream payloads.
+  t = t.replace(/^https?:\s*https?:\/\//i, "https://");
+  t = t.replace(/^https?:\/\/https?:\/\//i, "https://");
   if (t.startsWith("//")) return "https:" + t; // Scheme-relative, e.g. //example.com
   if (/^https?:\/\//i.test(t)) return t; // Already has http(s)://, return as is
   return "https://" + t.replace(/^\/+/, ""); // Prepend https:// and remove any leading slashes
