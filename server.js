@@ -63,7 +63,7 @@ function getBubbleDownloadAuthHeader() {
 }
 
 function buildDownloadHeaders(absUrl) {
-  const headers = { "User-Agent": "CastingRenderService/1" };
+  const headers = {};
   const authHeader = getBubbleDownloadAuthHeader();
   if (!authHeader) return headers;
   headers.Authorization = authHeader;
@@ -189,7 +189,7 @@ async function fetchBinary(url) {
   const t0 = Date.now();
   const authHeaders = buildDownloadHeaders(abs);
   const hasAuth = Boolean(authHeaders.Authorization);
-  const noAuthHeaders = { "User-Agent": "CastingRenderService/1" };
+  const noAuthHeaders = {};
 
   let res;
   try {
