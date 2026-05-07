@@ -186,6 +186,32 @@ async function fetchBinary(url) {
   console.log("Fetching:", abs);
   if (!abs) throw new Error("Missing file URL");
 
+  const fetchDownloadWithRedirects = async (startUrl, headers, labelBase) => {
+    const maxRedirects = Math.max(0, Number(process.env.DOWNLOAD_MAX_REDIRECTS || 5));
+    let currentUrl = startUrl;
+    for (let hop = 0; hop <= maxRedirects; hop++) {
+      const res = await fetchWithTimeout(
+        currentUrl,
+        {
+          ...fetchOpts,
+          redirect: "manual",
+          headers,
+        },
+        MEDIA_HTTP_TIMEOUT_MS,
+        `${labelBase}:hop-${hop}`
+      );
+
+      const status = Number(res.status || 0);
+      const isRedirect = status >= 300 && status < 400;
+      if (!isRedirect) return res;
+
+      const loc = res.headers.get("location");
+      if (!loc) return res;
+      currentUrl = new URL(loc, currentUrl).toString();
+    }
+    throw new Error(`Too many redirects while fetching media: ${startUrl}`);
+  };
+
   const t0 = Date.now();
   const authHeaders = buildDownloadHeaders(abs);
   const hasAuth = Boolean(authHeaders.Authorization);
@@ -193,31 +219,16 @@ async function fetchBinary(url) {
 
   let res;
   try {
-    res = await fetchWithTimeout(
-      abs,
-      { ...fetchOpts, headers: authHeaders },
-      MEDIA_HTTP_TIMEOUT_MS,
-      "fetchBinary:request"
-    );
+    res = await fetchDownloadWithRedirects(abs, authHeaders, "fetchBinary:request");
   } catch (err) {
     if (!hasAuth) throw err;
     console.warn(`[fetchBinary] request failed with token, retrying without token url=${abs}`);
-    res = await fetchWithTimeout(
-      abs,
-      { ...fetchOpts, headers: noAuthHeaders },
-      MEDIA_HTTP_TIMEOUT_MS,
-      "fetchBinary:request-no-token"
-    );
+    res = await fetchDownloadWithRedirects(abs, noAuthHeaders, "fetchBinary:request-no-token");
   }
 
   if (!res.ok && hasAuth) {
     console.warn(`[fetchBinary] status=${res.status} with token, retrying without token url=${abs}`);
-    const retryRes = await fetchWithTimeout(
-      abs,
-      { ...fetchOpts, headers: noAuthHeaders },
-      MEDIA_HTTP_TIMEOUT_MS,
-      "fetchBinary:request-no-token"
-    );
+    const retryRes = await fetchDownloadWithRedirects(abs, noAuthHeaders, "fetchBinary:request-no-token");
     if (retryRes.ok) res = retryRes;
   }
 
