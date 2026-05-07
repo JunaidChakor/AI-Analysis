@@ -557,7 +557,14 @@ async function analyzeCasting(properties) {
       genJson = parseJsonSafe(genText, "generateContent");
     } catch (e) {
       logError("gemini-parse-response", e, { modelName, status: genRes.status, bodySnippet: genText.slice(0, 1000) });
-      throw new Error(`generateContent ${genRes.status}: ${e.message || genText.slice(0, 800)}`);
+      // Return a structured synthetic error so retry/fallback can continue.
+      genJson = {
+        error: {
+          code: Number(genRes.status || 0),
+          status: "PARSE_ERROR",
+          message: `generateContent ${genRes.status}: ${String(e?.message || genText.slice(0, 800))}`,
+        },
+      };
     }
     return { genRes, genText, genJson, modelName };
   };
@@ -565,8 +572,9 @@ async function analyzeCasting(properties) {
   const buildGeminiError = (resp, fallbackMessage = "Model request failed") => {
     const message = String(resp?.genJson?.error?.message || resp?.genText || fallbackMessage);
     const err = new Error(message);
-    err.gemini_status = Number(resp?.genRes?.status || 0);
-    err.error_code = Number(resp?.genJson?.error?.code || 0);
+    err.gemini_http_status = Number(resp?.genRes?.status || 0);
+    err.gemini_status = String(resp?.genJson?.error?.status || "success");
+    err.error_code = Number(resp?.genJson?.error?.code || resp?.genRes?.status || 0);
     return err;
   };
 
@@ -587,6 +595,7 @@ async function analyzeCasting(properties) {
   const maxAttemptsPerModel = Math.max(1, Number(process.env.MODEL_MAX_ATTEMPTS || 3));
   let genAttempt = null;
   let finalError = null;
+  let preferredGeminiFailure = null;
 
   for (let modelIndex = 0; modelIndex < modelPriority.length; modelIndex++) {
     const modelName = modelPriority[modelIndex];
@@ -597,6 +606,17 @@ async function analyzeCasting(properties) {
       if (genAttempt.genRes.ok) break;
 
       finalError = buildGeminiError(genAttempt, "Model request failed");
+      const errorStatus = Number(genAttempt?.genRes?.status || 0);
+      const errorMessage = String(genAttempt?.genJson?.error?.message || "").toLowerCase();
+      const isHighDemand503 =
+        errorStatus === 503 &&
+        (errorMessage.includes("high demand") ||
+          errorMessage.includes("spikes in demand") ||
+          errorMessage.includes("try again later") ||
+          String(genAttempt?.genJson?.error?.status || "").toUpperCase() === "UNAVAILABLE");
+      if (isHighDemand503 && !preferredGeminiFailure) {
+        preferredGeminiFailure = genAttempt;
+      }
       const shouldRetry = isRetryableModelError(genAttempt) && attempt < maxAttemptsPerModel;
       if (!shouldRetry) break;
 
@@ -609,6 +629,7 @@ async function analyzeCasting(properties) {
   }
 
   if (!genAttempt || !genAttempt.genRes.ok) {
+    if (preferredGeminiFailure) throw buildGeminiError(preferredGeminiFailure, "Model request failed");
     throw finalError || buildGeminiError(genAttempt, "Model request failed");
   }
   if (!genAttempt.genJson.candidates?.length) {
@@ -641,8 +662,8 @@ async function analyzeCasting(properties) {
     considerations: toStrList(parsed.considerations),
     recommendation: s(parsed.recommendation),
     ai_score: aiScore,
-    gemini_status: Number(genAttempt.genRes.status || 0),
-    error_code: 0,
+    gemini_status: "OK",
+    error: 0,
   };
 }
 
@@ -807,9 +828,8 @@ function pumpQueue() {
 
         await sendBubbleCallback(
           {
-            status: "completed",
+            status: "success",
             application_id: payload.application_id ?? null,
-            video_link: payload.video_link ?? payload.video_url ?? null,
             ...result,
           },
           payload.callback_url
@@ -833,12 +853,10 @@ function pumpQueue() {
         try {
           await sendBubbleCallback(
             {
-              status: "failed",
+              status: String(err?.message || "failed"),
               application_id: payload.application_id ?? null,
-              video_link: payload.video_link ?? payload.video_url ?? null,
-              error: String(err?.message || err),
-              error_code: Number(err?.error_code || 0),
-              gemini_status: Number(err?.gemini_status || 0),
+              error: Number(err?.error_code || 0),
+              gemini_status: String(err?.gemini_status || ""),
             },
             payload.callback_url
           );
